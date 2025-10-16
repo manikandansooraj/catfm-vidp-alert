@@ -77,50 +77,28 @@ def find_pdf_links():
     return ordered
 
 def extract_callsigns_from_pdf_bytes(pdf_bytes):
-    callsigns = []
-    # create temp file
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    try:
-        tmp.write(pdf_bytes)
-        tmp.close()
-        doc = fitz.open(tmp.name)
+    import fitz
+    import re
+    from io import BytesIO
+
+    callsigns = set()
+    pattern_callsign = re.compile(r"\b([A-Z]{2,3}\d{2,4}[A-Z]?)\b")
+    pattern_vidp = re.compile(r"\bVIDP\b")
+
+    with fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf") as doc:
         for page in doc:
-            # get clean text per page
             text = page.get_text("text")
-            # split into lines to preserve adjacency
-            for line in text.splitlines():
+            lines = text.splitlines()
+
+            for i, line in enumerate(lines):
                 if "VIDP" in line.upper():
-                    # try to find callsign in same line (search left/right)
-                    # first search for tokens that match callsign regex
-                    tokens = CALLSIGN_RE.findall(line.upper())
-                    if tokens:
-                        callsigns.extend(tokens)
-                    else:
-                        # fallback: look at neighboring words: split and find token adjacent to VIDP
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if part.upper() == "VIDP":
-                                # look left
-                                if i-1 >= 0:
-                                    m = CALLSIGN_RE.search(parts[i-1].upper())
-                                    if m:
-                                        callsigns.append(m.group(1))
-                                # look right
-                                if i+1 < len(parts):
-                                    m = CALLSIGN_RE.search(parts[i+1].upper())
-                                    if m:
-                                        callsigns.append(m.group(1))
-        # dedupe preserving order
-        seen_cs = []
-        for c in callsigns:
-            if c not in seen_cs:
-                seen_cs.append(c)
-        return seen_cs
-    finally:
-        try:
-            os.remove(tmp.name)
-        except Exception:
-            pass
+                    # Grab nearby context
+                    window = " ".join(lines[max(0, i-2): min(len(lines), i+3)])
+                    # Find possible callsigns in window
+                    for match in pattern_callsign.findall(window):
+                        callsigns.add(match)
+
+    return list(callsigns)
 
 def process_new_pdfs():
     seen = load_seen()
