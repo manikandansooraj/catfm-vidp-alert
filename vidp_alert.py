@@ -10,6 +10,9 @@ from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
 import fitz  # PyMuPDF
 
+print("Testing email alert...")
+send_email("Test Alert", "This is a test email from the VIDP alert automation.")
+
 # ---- Configuration ----
 BASE_URL = "https://www.atfmaai.aero"
 LIST_URL = BASE_URL + "/portal/en/news/atfm-measures"
