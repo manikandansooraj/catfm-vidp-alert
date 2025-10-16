@@ -1,32 +1,30 @@
-# vidp_alert.py
-# Python 3 script. Expects EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_TO in environment.
 import os
 import re
 import requests
 import json
 import smtplib
-import tempfile
 from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
+from io import BytesIO
 import fitz  # PyMuPDF
 
-# ---- Configuration ----
-BASE_URL = "https://www.atfmaai.aero"
-LIST_URL = BASE_URL + "/portal/en/news/atfm-measures"
-SEEN_FILE = "seen.json"     # persisted in repo by workflow commit
+# ------- CONFIGURATION --------
+LIST_URL = "https://www.atfmaai.aero/portal/en/news/atfm-measures"
+SEEN_FILE = "seen.json"
 USER_AGENT = "VIDP-ATFM-Watcher/1.0"
 
+# Email config via environment variables
 EMAIL_USERNAME = os.environ.get("EMAIL_USERNAME")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
-# set more aggressive timeout for PDF downloads
-REQUEST_TIMEOUT = 30
+PDF_DOWNLOAD_TIMEOUT = 30  # seconds
 
-# callsign regex: 2-4 letters followed by 1-4 digits OR some operator codes, fallback
-CALLSIGN_RE = re.compile(r"\b([A-Z]{2,4}\d{1,4})\b")
+# Regexes
+PATTERN_CALLSIGN = re.compile(r"\b([A-Z]{2,3}\d{1,4}[A-Z]?)\b")
+PATTERN_VIDP = re.compile(r"\bVIDP\b", re.IGNORECASE)
 
-# ---- Helpers ----
+# -------- Helpers --------
 def load_seen():
     if os.path.exists(SEEN_FILE):
         try:
@@ -42,107 +40,108 @@ def save_seen(seen):
 
 def send_email(subject, body):
     if not EMAIL_USERNAME or not EMAIL_PASSWORD or not EMAIL_TO:
-        print("Email credentials not set. Skipping email.")
-        return
+        print("Missing email credentials — cannot send.")
+        return False
     msg = MIMEText(body, "plain")
     msg["From"] = EMAIL_USERNAME
     msg["To"] = EMAIL_TO
     msg["Subject"] = subject
-    s = smtplib.SMTP("smtp.gmail.com", 587, timeout=60)
-    s.starttls()
-    s.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-    s.send_message(msg)
-    s.quit()
-    print("Email sent:", subject)
+    try:
+        s = smtplib.SMTP("smtp.gmail.com", 587, timeout=60)
+        s.starttls()
+        s.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        s.send_message(msg)
+        s.quit()
+        print("Email sent:", subject)
+        return True
+    except Exception as e:
+        print("Error sending email:", e)
+        return False
 
 def find_pdf_links():
     headers = {"User-Agent": USER_AGENT}
-    r = requests.get(LIST_URL, headers=headers, timeout=15)
+    r = requests.get(LIST_URL, headers=headers, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
+        # Check if link is PDF
         if href.lower().endswith(".pdf"):
             if href.startswith("/"):
-                href = BASE_URL + href
+                href = "https://www.atfmaai.aero" + href
             links.append(href)
-    # keep order and unique
+    # dedupe in order
     seen = set()
     ordered = []
-    for v in links:
-        if v not in seen:
-            seen.add(v)
-            ordered.append(v)
+    for l in links:
+        if l not in seen:
+            seen.add(l)
+            ordered.append(l)
     return ordered
 
 def extract_callsigns_from_pdf_bytes(pdf_bytes):
-    import fitz
-    import re
-    from io import BytesIO
-
     callsigns = set()
-    pattern_callsign = re.compile(r"\b([A-Z]{2,3}\d{2,4}[A-Z]?)\b")
-    pattern_vidp = re.compile(r"\bVIDP\b")
-
     with fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf") as doc:
         for page in doc:
             text = page.get_text("text")
             lines = text.splitlines()
-
             for i, line in enumerate(lines):
-                if "VIDP" in line.upper():
-                    # Grab nearby context
-                    window = " ".join(lines[max(0, i-2): min(len(lines), i+3)])
-                    # Find possible callsigns in window
-                    for match in pattern_callsign.findall(window):
-                        callsigns.add(match)
-
+                if PATTERN_VIDP.search(line):
+                    # build small context window
+                    start = max(0, i - 2)
+                    end = min(len(lines), i + 3)
+                    window = " ".join(lines[start:end])
+                    for m in PATTERN_CALLSIGN.findall(window):
+                        callsigns.add(m)
     return list(callsigns)
 
 def process_new_pdfs():
     seen = load_seen()
     new_seen = set(seen)
-    found_alerts = []
+    alerts = []
 
     pdfs = find_pdf_links()
     print("Found PDF links:", len(pdfs))
-    for pdf_url in pdfs:
-        if pdf_url in seen:
+    for url in pdfs:
+        if url in seen:
             continue
-        print("Processing new PDF:", pdf_url)
+        print("Downloading PDF:", url)
         try:
-            r = requests.get(pdf_url, timeout=REQUEST_TIMEOUT)
+            r = requests.get(url, timeout=PDF_DOWNLOAD_TIMEOUT)
             r.raise_for_status()
         except Exception as e:
-            print("Failed to download PDF:", e)
+            print("Failed download:", e)
             continue
-        callsigns = extract_callsigns_from_pdf_bytes(r.content)
-        if callsigns:
-            found_alerts.append((pdf_url, callsigns))
-            print("VIDP callsigns found:", callsigns)
+
+        calls = extract_callsigns_from_pdf_bytes(r.content)
+        if calls:
+            alerts.append((url, calls))
+            print("VIDP callsigns found:", calls)
         else:
-            print("No VIDP mentions in this PDF.")
-        new_seen.add(pdf_url)
+            print("No VIDP in this PDF.")
+
+        new_seen.add(url)
 
     save_seen(new_seen)
-    return found_alerts
+    return alerts
 
 def main():
     alerts = process_new_pdfs()
     if not alerts:
         print("No new VIDP entries found.")
         return
-    # compose email body
-    lines = []
-    for pdf_url, calls in alerts:
-        lines.append(f"PDF: {pdf_url}")
-        lines.append("Callsigns found:")
+
+    body_lines = []
+    for url, calls in alerts:
+        body_lines.append(f"PDF: {url}")
+        body_lines.append("Callsigns found:")
         for c in calls:
-            lines.append(f" - {c}")
-        lines.append("")  # blank line
-    body = "\n".join(lines)
+            body_lines.append(" - " + c)
+        body_lines.append("")  # blank line
+
     subject = f"VIDP ATFM Alert — {len(alerts)} file(s) with matches"
+    body = "\n".join(body_lines)
     send_email(subject, body)
 
 if __name__ == "__main__":
